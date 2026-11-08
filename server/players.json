@@ -1,402 +1,1038 @@
-'use strict';
-const express = require('express');
-const http = require('http');
-const path = require('path');
-const crypto = require('crypto');
-const { Server } = require('socket.io');
-const db = require('./db');
-const BASE_PLAYERS = require('./players.json');
-const TEAMS = require('./teams.json');
-
-const PORT = process.env.PORT || 3000;
-const CLIENT = path.join(__dirname, '..', 'client');
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: process.env.CORS_ORIGIN || false },
-  pingInterval: 10000, pingTimeout: 8000, maxHttpBufferSize: 1e5,
-});
-
-app.disable('x-powered-by');
-app.set('trust proxy', 1);
-app.use((q, s, n) => {
-  s.set({ 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'SAMEORIGIN', 'Referrer-Policy': 'strict-origin-when-cross-origin' });
-  n();
-});
-app.use(express.json({ limit: '10kb' }));
-
-// ---------- helpers ----------
-const hits = new Map();
-const limit = (max, ms) => (q, s, n) => {
-  const k = q.ip + q.path, now = Date.now();
-  let h = hits.get(k);
-  if (!h || now > h.t) { h = { t: now + ms, c: 0 }; hits.set(k, h); }
-  if (++h.c > max) return s.status(429).json({ error: 'Too many requests, slow down' });
-  n();
-};
-setInterval(() => { const n = Date.now(); for (const [k, h] of hits) if (n > h.t) hits.delete(k); }, 60000).unref();
-
-const clean = (s, n = 20) => String(s ?? '').replace(/[<>&"'`]/g, '').replace(/\s+/g, ' ').trim().slice(0, n);
-const rid = () => crypto.randomBytes(4).toString('hex');
-const num = (v, a, b, def) => { v = Math.round(Number(v)); return Number.isFinite(v) && v >= a && v <= b ? v : def; };
-const shuffle = a => { for (let i = a.length - 1; i > 0; i--) { const j = crypto.randomInt(i + 1); [a[i], a[j]] = [a[j], a[i]]; } return a; };
-const log = (...a) => console.log(new Date().toISOString(), ...a);
-
-const rooms = new Map();
-const rt = new Map(); // runtime timer handles, never persisted
-const H = c => { let h = rt.get(c); if (!h) { h = {}; rt.set(c, h); } return h; };
-const clearTimers = r => { const h = H(r.code); clearTimeout(h.t); clearTimeout(h.adv); };
-
-function genCode() {
-  const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  for (;;) { let c = ''; for (let i = 0; i < 6; i++) c += A[crypto.randomInt(A.length)]; if (!rooms.has(c)) return c; }
-}
-function createRoom(name) {
-  const code = genCode();
-  const m = { id: rid(), token: crypto.randomBytes(24).toString('hex'), name, teamId: null, connected: false };
-  const r = {
-    code, phase: 'lobby', hostId: m.id, touched: Date.now(), members: { [m.id]: m },
-    config: { purse: 10000, squad: 15, timer: 7, steps: [20, 25, 50, 100], auto: true },
-    pool: BASE_PLAYERS.map(p => ({ ...p })), teams: {}, queue: [], idx: 0, round: 1,
-    cur: null, queueDone: false, sold: [], unsold: [],
-  };
-  rooms.set(code, r); persist(r);
-  log('room created', code);
-  return { r, m };
-}
-
-function persist(r) {
-  r.touched = Date.now();
-  const h = H(r.code); clearTimeout(h.save);
-  h.save = setTimeout(() => db.saveRoom(r.code, r).catch(e => console.error('[db] save failed', e.message)), 400);
-}
-const year = () => new Date().getFullYear();
-const poolOut = r => r.pool.map(p => ({ id: p.id, name: p.name, photo: p.photo, nat: p.nat, age: year() - p.born, bat: p.bat, bowl: p.bowl, role: p.role, base: p.base, ipl: p.ipl }));
-
-function pub(r) {
-  const mem = Object.values(r.members);
-  return {
-    now: Date.now(), code: r.code, phase: r.phase, hostId: r.hostId, config: r.config, round: r.round, queueDone: r.queueDone,
-    remaining: r.cur ? Math.max(0, r.queue.length - r.idx - 1) : 0,
-    members: mem.map(m => ({ id: m.id, name: m.name, teamId: m.teamId, connected: m.connected })),
-    teams: TEAMS.map(t => {
-      const o = mem.find(m => m.teamId === t.id), tm = r.teams[t.id];
-      return { id: t.id, ownerId: o ? o.id : null, owner: o ? o.name : null, purse: tm ? tm.purse : r.config.purse, squad: tm ? tm.squad : [] };
-    }),
-    cur: r.cur && { pid: r.cur.pid, bid: r.cur.bid, bidTeam: r.cur.bidTeam, history: r.cur.history.slice(0, 30), endsAt: r.cur.endsAt, remaining: r.cur.remaining, status: r.cur.status },
-    sold: r.sold, unsold: r.unsold,
-    next: r.cur ? r.queue.slice(r.idx + 1, r.idx + 4) : [],
-    ratings: ratingsOf(r), standings: r.phase === 'ended' ? standings(r) : null,
-  };
-}
-// ratings are only revealed for players who have been SOLD
-function ratingsOf(r) {
-  const o = {}, P = Object.fromEntries(r.pool.map(p => [p.id, p]));
-  r.sold.forEach(x => { if (P[x.pid]) o[x.pid] = P[x.pid].rating || 0; });
-  return o;
-}
-function standings(r) {
-  const P = Object.fromEntries(r.pool.map(p => [p.id, p])), mem = Object.values(r.members);
-  return Object.entries(r.teams).map(([tid, t]) => {
-    const rs = t.squad.map(x => (P[x.pid] && P[x.pid].rating) || 0), sum = rs.reduce((a, b) => a + b, 0);
-    const m = mem.find(x => x.teamId === tid);
-    return { teamId: tid, owner: m ? m.name : '', players: rs.length, avg: rs.length ? +(sum / rs.length).toFixed(2) : 0,
-      score: +(sum / r.config.squad).toFixed(2), spent: r.config.purse - t.purse, purse: t.purse };
-  }).sort((a, b) => b.score - a.score || b.players - a.players || b.purse - a.purse);
-}
-const push = r => io.to(r.code).emit('state', pub(r));
-const say = (r, msg) => io.to(r.code).emit('toast', msg);
-
-// ---------- auction engine (single-threaded => every handler is atomic) ----------
-function startPlayer(r) {
-  r.cur = { pid: r.queue[r.idx], bid: 0, bidTeam: null, history: [], endsAt: Date.now() + r.config.timer * 1000, remaining: 0, status: 'bidding' };
-  arm(r);
-}
-function arm(r) {
-  const h = H(r.code); clearTimeout(h.t);
-  h.t = setTimeout(() => { finish(r); push(r); persist(r); }, Math.max(0, r.cur.endsAt - Date.now()) + 30);
-}
-function finish(r) {
-  const c = r.cur;
-  if (!c || c.status !== 'bidding') return; // a player can never be sold twice
-  const h = H(r.code); clearTimeout(h.t);
-  if (c.bidTeam) {
-    const t = r.teams[c.bidTeam];
-    t.purse -= c.bid; t.squad.push({ pid: c.pid, price: c.bid });
-    r.sold.push({ pid: c.pid, teamId: c.bidTeam, price: c.bid, round: r.round });
-    c.status = 'sold';
-  } else { r.unsold.push(c.pid); c.status = 'unsold'; }
-  c.endsAt = Date.now();
-  if (r.config.auto) { clearTimeout(h.adv); h.adv = setTimeout(() => { advance(r); push(r); persist(r); }, 5000); }
-}
-function endAuction(r) { clearTimers(r); r.phase = 'ended'; r.cur = null; r.queueDone = false; say(r, 'Auction complete!'); }
-function advance(r) {
-  clearTimers(r);
-  if (r.phase !== 'live') return;
-  if (Object.values(r.teams).every(t => t.squad.length >= r.config.squad)) { say(r, 'All squads are full!'); endAuction(r); return; }
-  r.idx++;
-  if (r.idx >= r.queue.length) {
-    r.cur = null; r.queueDone = true;
-    if (!r.unsold.length || r.round >= 2) endAuction(r);
-  } else startPlayer(r);
-}
-
-const A = {
-  start(r) {
-    if (r.phase !== 'lobby') return 'Auction already started';
-    const sel = Object.values(r.members).filter(m => m.teamId);
-    if (sel.length < 2) return 'At least 2 franchises must be selected';
-    r.teams = {}; sel.forEach(m => { r.teams[m.teamId] = { purse: r.config.purse, squad: [] }; });
-    r.queue = shuffle(r.pool.filter(p => p.available !== false).map(p => p.id));
-    r.idx = 0; r.round = 1; r.sold = []; r.unsold = []; r.queueDone = false; r.phase = 'live';
-    startPlayer(r); say(r, 'The auction has begun!');
-  },
-  pause(r) {
-    const c = r.cur; if (r.phase !== 'live' || !c || c.status !== 'bidding') return 'Nothing to pause';
-    clearTimers(r); c.remaining = Math.max(0, c.endsAt - Date.now()); c.status = 'paused';
-  },
-  resume(r) {
-    const c = r.cur; if (!c || c.status !== 'paused') return 'Not paused';
-    c.endsAt = Date.now() + Math.max(1500, c.remaining); c.status = 'bidding'; arm(r);
-  },
-  skip(r) {
-    const c = r.cur; if (!c || !['bidding', 'paused'].includes(c.status)) return 'Nothing to skip';
-    if (r.idx >= r.queue.length - 1) return 'No other players left to skip to';
-    clearTimers(r); r.queue.push(r.queue.splice(r.idx, 1)[0]); startPlayer(r);
-  },
-  unsold(r) {
-    const c = r.cur; if (!c || !['bidding', 'paused'].includes(c.status)) return 'Nothing to mark';
-    c.status = 'bidding'; c.bid = 0; c.bidTeam = null; c.history = []; finish(r);
-  },
-  next(r) {
-    if (r.phase !== 'live' || !r.cur || !['sold', 'unsold'].includes(r.cur.status)) return 'Nothing to advance';
-    advance(r);
-  },
-  unsoldRound(r) {
-    if (r.phase !== 'live' || !r.queueDone || r.round !== 1 || !r.unsold.length) return 'No unsold round available';
-    r.queue = r.unsold; r.unsold = []; r.idx = 0; r.round = 2; r.queueDone = false; startPlayer(r);
-    say(r, 'Unsold round started');
-  },
-  restart(r) {
-    clearTimers(r); r.phase = 'lobby'; r.teams = {}; r.queue = []; r.idx = 0; r.round = 1;
-    r.cur = null; r.queueDone = false; r.sold = []; r.unsold = [];
-    say(r, 'Auction reset to the lobby');
-  },
-  end(r) { if (r.phase === 'ended') return 'Already ended'; endAuction(r); },
-};
-
-function placeBid(r, m, d) {
-  const c = r.cur;
-  if (r.phase !== 'live' || !c) return 'No live auction';
-  if (c.status === 'paused') return 'Auction is paused';
-  if (c.status !== 'bidding' || Date.now() > c.endsAt) return 'Bidding has closed';
-  if (!m.teamId) return 'Select a franchise first';
-  if (!r.config.steps.includes(d.step)) return 'Invalid bid step';
-  if (d.atBid !== c.bid) return 'Bid changed - try again'; // stale / double-tap / retry protection
-  if (c.bidTeam === m.teamId) return 'You are already the highest bidder';
-  const p = r.pool.find(x => x.id === c.pid), team = r.teams[m.teamId];
-  const amount = c.bid === 0 ? p.base : c.bid + d.step;
-  if (team.squad.length >= r.config.squad) return 'Your squad is full';
-  if (amount > team.purse) return 'Not enough purse';
-  c.bid = amount; c.bidTeam = m.teamId;
-  c.history.unshift({ teamId: m.teamId, amount, at: Date.now() });
-  c.endsAt = Date.now() + r.config.timer * 1000; // every valid bid resets the timer
-  arm(r);
-}
-
-// ---------- host / membership ----------
-function pickHost(r) { const a = Object.values(r.members); return a.find(x => x.connected && x.teamId) || a.find(x => x.connected) || null; }
-function hostGone(r, m) {
-  if (r.hostId !== m.id) return;
-  const h = H(r.code); clearTimeout(h.dc);
-  h.dc = setTimeout(() => {
-    if (r.members[r.hostId] && r.members[r.hostId].connected) return;
-    const n = pickHost(r);
-    if (n) { r.hostId = n.id; say(r, `${n.name} is now the host`); push(r); persist(r); }
-  }, 30000);
-}
-
-// ---------- REST ----------
-app.get('/healthz', (q, s) => s.json({ ok: true, rooms: rooms.size }));
-app.get('/api/teams', (q, s) => s.json(TEAMS));
-app.post('/api/rooms', limit(10, 60000), (q, s) => {
-  const name = clean(q.body && q.body.name);
-  if (!name) return s.status(400).json({ error: 'Enter your name' });
-  const { r, m } = createRoom(name);
-  s.json({ code: r.code, token: m.token, memberId: m.id });
-});
-app.get('/api/rooms/:code', limit(60, 60000), (q, s) => {
-  const r = rooms.get(String(q.params.code).toUpperCase());
-  if (!r) return s.status(404).json({ exists: false });
-  s.json({ exists: true, players: Object.keys(r.members).length, phase: r.phase });
-});
-app.get('/api/rooms/:code/export.csv', limit(30, 60000), (q, s) => {
-  const r = rooms.get(String(q.params.code).toUpperCase());
-  if (!r || !Object.values(r.members).some(m => m.token === q.query.t)) return s.status(403).end();
-  const P = Object.fromEntries(r.pool.map(p => [p.id, p]));
-  const rows = [['Status', 'Team', 'Owner', 'Player', 'Role', 'Nationality', 'Price (Cr)', 'Round', 'Rating']];
-  r.sold.forEach(x => {
-    const t = TEAMS.find(t => t.id === x.teamId), o = Object.values(r.members).find(m => m.teamId === x.teamId);
-    rows.push(['SOLD', t.name, o ? o.name : '', P[x.pid].name, P[x.pid].role, P[x.pid].nat, (x.price / 100).toFixed(2), x.round, P[x.pid].rating]);
-  });
-  r.unsold.forEach(id => rows.push(['UNSOLD', '', '', P[id].name, P[id].role, P[id].nat, (P[id].base / 100).toFixed(2) + ' (base)', '']));
-  const f = v => { v = String(v); if (/^[=+\-@]/.test(v)) v = "'" + v; return '"' + v.replace(/"/g, '""') + '"'; };
-  s.set({ 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="ipl-auction-${r.code}.csv"` })
-    .send('\ufeff' + rows.map(x => x.map(f).join(',')).join('\n'));
-});
-app.use(express.static(CLIENT, { maxAge: '5m' }));
-app.get('/room/:code', (q, s) => s.sendFile(path.join(CLIENT, 'index.html')));
-app.use((q, s) => s.status(404).send('Not found'));
-
-// ---------- sockets ----------
-io.on('connection', socket => {
-  let bucket = { t: Date.now(), c: 0 };
-  const allowed = () => { const n = Date.now(); if (n - bucket.t > 1000) bucket = { t: n, c: 0 }; return ++bucket.c <= 15; };
-  const ctx = () => {
-    const r = rooms.get(socket.data.code), m = r && r.members[socket.data.mid];
-    return r && m ? { r, m } : null;
-  };
-  const on = (ev, fn) => socket.on(ev, (arg, ack) => {
-    if (typeof arg === 'function') { ack = arg; arg = {}; }
-    if (typeof ack !== 'function') ack = () => {};
-    try {
-      if (!allowed()) return ack({ error: 'Slow down' });
-      if (arg === null || typeof arg !== 'object') arg = {};
-      if (ev === 'join') return fn(arg, ack);
-      const c = ctx(); if (!c) return ack({ error: 'Not in a room' });
-      fn(arg, ack, c.r, c.m);
-    } catch (e) { console.error('[socket]', ev, e); ack({ error: 'Server error' }); }
-  });
-  const host = (r, m, ack) => r.hostId === m.id ? true : (ack({ error: 'Only the room host can do this' }), false);
-
-  on('join', (d, ack) => {
-    const r = rooms.get(String(d.code || '').toUpperCase().trim());
-    if (!r) return ack({ error: 'Room not found' });
-    const token = typeof d.token === 'string' ? d.token : '';
-    let m = token && Object.values(r.members).find(x => x.token === token);
-    if (!m) {
-      let name = clean(d.name);
-      if (!name) return ack({ error: 'Enter your name' });
-      if (Object.keys(r.members).length >= 10) return ack({ error: 'Room is full (10 players max)' });
-      if (Object.values(r.members).some(x => x.name.toLowerCase() === name.toLowerCase())) name = (name.slice(0, 17) + ' ' + rid().slice(0, 2));
-      m = { id: rid(), token: crypto.randomBytes(24).toString('hex'), name, teamId: null, connected: false };
-      r.members[m.id] = m; say(r, `${m.name} joined the room`);
-    } else if (!m.connected) say(r, `${m.name} reconnected`);
-    socket.data = { code: r.code, mid: m.id };
-    socket.join(r.code); m.connected = true;
-    clearTimeout(H(r.code).dc);
-    ack({ memberId: m.id, token: m.token, teams: TEAMS });
-    socket.emit('pool', poolOut(r));
-    push(r); persist(r);
-  });
-
-  on('team:select', (d, ack, r, m) => {
-    if (r.phase !== 'lobby') return ack({ error: 'Teams are locked once the auction starts' });
-    if (d.teamId === null || d.teamId === '') { m.teamId = null; push(r); persist(r); return ack({ ok: true }); }
-    const t = TEAMS.find(x => x.id === d.teamId); if (!t) return ack({ error: 'Unknown franchise' });
-    const o = Object.values(r.members).find(x => x.teamId === t.id && x.id !== m.id);
-    if (o) return ack({ error: `${t.name} is already taken by ${o.name}` });
-    m.teamId = t.id; push(r); persist(r); ack({ ok: true });
-  });
-
-  on('config:update', (d, ack, r, m) => {
-    if (!host(r, m, ack)) return;
-    if (r.phase !== 'lobby') return ack({ error: 'Rules are locked once the auction starts' });
-    const c = r.config;
-    c.purse = num(d.purse, 500, 100000, c.purse); c.squad = num(d.squad, 3, 30, c.squad);
-    c.timer = num(d.timer, 3, 60, c.timer); c.auto = !!d.auto;
-    if (Array.isArray(d.steps)) {
-      const s = [...new Set(d.steps.map(x => Math.round(Number(x))).filter(x => x >= 1 && x <= 1000))].sort((a, b) => a - b).slice(0, 6);
-      if (s.length) c.steps = s;
-    }
-    push(r); persist(r); ack({ ok: true });
-  });
-
-  on('player:add', (d, ack, r, m) => {
-    if (!host(r, m, ack)) return;
-    if (r.phase !== 'lobby') return ack({ error: 'Add players before the auction starts' });
-    const name = clean(d.name, 40); if (name.length < 2) return ack({ error: 'Enter a player name' });
-    const role = ['BAT', 'BOWL', 'AR', 'WK'].includes(d.role) ? d.role : null; if (!role) return ack({ error: 'Pick a role' });
-    if (r.pool.length >= 300) return ack({ error: 'Player pool limit reached' });
-    r.pool.push({
-      id: 'c-' + rid(), name, role, nat: clean(d.nat, 30) || 'India', born: year() - num(d.age, 15, 50, 28),
-      bat: clean(d.bat, 20) || 'Right-hand bat', bowl: clean(d.bowl, 30) || 'Does not bowl', base: num(d.base, 10, 2000, 100), rating: num(d.rating, 40, 99, 70),
-      photo: /^https:\/\/[^\s"'<>]{1,300}$/.test(d.photo || '') ? d.photo : '', ipl: [], available: true,
-    });
-    io.to(r.code).emit('pool', poolOut(r)); say(r, `${name} added to the pool`); persist(r); ack({ ok: true });
-  });
-
-  on('host:transfer', (d, ack, r, m) => {
-    if (!host(r, m, ack)) return;
-    const t = r.members[d.memberId]; if (!t) return ack({ error: 'Player not found' });
-    r.hostId = t.id; say(r, `${t.name} is now the host`); push(r); persist(r); ack({ ok: true });
-  });
-
-  on('member:kick', (d, ack, r, m) => {
-    if (!host(r, m, ack)) return;
-    if (r.phase !== 'lobby') return ack({ error: 'Players can only be removed in the lobby' });
-    const t = r.members[d.memberId]; if (!t || t.id === m.id) return ack({ error: 'Cannot remove that player' });
-    delete r.members[t.id];
-    for (const [, s] of io.sockets.sockets) if (s.data && s.data.mid === t.id && s.data.code === r.code) { s.emit('kicked'); s.leave(r.code); s.data = {}; }
-    say(r, `${t.name} was removed`); push(r); persist(r); ack({ ok: true });
-  });
-
-  on('leave', (d, ack, r, m) => {
-    if (r.phase === 'lobby') {
-      delete r.members[m.id];
-      if (r.hostId === m.id) { const n = Object.values(r.members).find(x => x.connected) || Object.values(r.members)[0]; if (n) r.hostId = n.id; }
-      say(r, `${m.name} left the room`);
-    } else { m.connected = false; hostGone(r, m); }
-    socket.leave(r.code); socket.data = {}; ack({ ok: true }); push(r); persist(r);
-  });
-
-  Object.keys(A).forEach(k => on('auction:' + k, (d, ack, r, m) => {
-    if (!host(r, m, ack)) return;
-    const e = A[k](r); if (e) return ack({ error: e });
-    log('auction', k, r.code); push(r); persist(r); ack({ ok: true });
-  }));
-
-  on('bid', (d, ack, r, m) => {
-    const e = placeBid(r, m, { atBid: Number(d.atBid), step: Number(d.step) });
-    if (e) return ack({ error: e });
-    push(r); persist(r); ack({ ok: true });
-  });
-
-  socket.on('disconnect', () => {
-    const c = ctx(); if (!c) return;
-    const { r, m } = c;
-    const still = [...(io.sockets.adapter.rooms.get(r.code) || [])].some(id => id !== socket.id && io.sockets.sockets.get(id)?.data?.mid === m.id);
-    if (still) return;
-    m.connected = false; say(r, `${m.name} disconnected`); hostGone(r, m); push(r);
-  });
-});
-
-// ---------- lifecycle ----------
-setInterval(() => {
-  const now = Date.now();
-  for (const [code, r] of rooms) {
-    if (Object.values(r.members).some(m => m.connected)) continue;
-    if (now - r.touched > 24 * 3600 * 1000) { clearTimers(r); rooms.delete(code); rt.delete(code); db.deleteRoom(code).catch(() => {}); log('room expired', code); }
-  }
-}, 3600 * 1000).unref();
-
-async function boot() {
-  await db.init();
-  for (const r of await db.loadRooms()) {
-    Object.values(r.members).forEach(m => { m.connected = false; });
-    if (r.phase === 'live' && r.cur) {
-      if (r.cur.status === 'bidding') { r.cur.status = 'paused'; r.cur.remaining = r.config.timer * 1000; } // timers don't survive restarts: resume paused
-      else if (r.config.auto && r.cur.status !== 'paused') H(r.code).adv = setTimeout(() => { advance(r); push(r); persist(r); }, 3000);
-    }
-    rooms.set(r.code, r);
-  }
-  log('restored rooms:', rooms.size);
-  server.listen(PORT, () => log('IPL Auction Arena listening on', PORT));
-}
-async function shutdown() {
-  log('shutting down, saving rooms');
-  try { await Promise.all([...rooms.values()].map(r => db.saveRoom(r.code, r))); } catch (e) { console.error(e.message); }
-  process.exit(0);
-}
-process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown);
-boot().catch(e => { console.error('Boot failed', e); process.exit(1); });
+[
+ {
+  "id": "virat-kohli",
+  "name": "Virat Kohli",
+  "photo": "",
+  "nat": "India",
+  "born": 1988,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm medium",
+  "role": "BAT",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 93
+ },
+ {
+  "id": "rohit-sharma",
+  "name": "Rohit Sharma",
+  "photo": "",
+  "nat": "India",
+  "born": 1987,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm off-break",
+  "role": "BAT",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 91
+ },
+ {
+  "id": "ms-dhoni",
+  "name": "MS Dhoni",
+  "photo": "",
+  "nat": "India",
+  "born": 1981,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm medium",
+  "role": "WK",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 88
+ },
+ {
+  "id": "jasprit-bumrah",
+  "name": "Jasprit Bumrah",
+  "photo": "",
+  "nat": "India",
+  "born": 1993,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm fast",
+  "role": "BOWL",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 96
+ },
+ {
+  "id": "ravindra-jadeja",
+  "name": "Ravindra Jadeja",
+  "photo": "",
+  "nat": "India",
+  "born": 1988,
+  "bat": "Left-hand bat",
+  "bowl": "Slow left-arm orthodox",
+  "role": "AR",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 90
+ },
+ {
+  "id": "hardik-pandya",
+  "name": "Hardik Pandya",
+  "photo": "",
+  "nat": "India",
+  "born": 1993,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm fast-medium",
+  "role": "AR",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 90
+ },
+ {
+  "id": "kl-rahul",
+  "name": "KL Rahul",
+  "photo": "",
+  "nat": "India",
+  "born": 1992,
+  "bat": "Right-hand bat",
+  "bowl": "Does not bowl",
+  "role": "WK",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 88
+ },
+ {
+  "id": "rishabh-pant",
+  "name": "Rishabh Pant",
+  "photo": "",
+  "nat": "India",
+  "born": 1997,
+  "bat": "Left-hand bat",
+  "bowl": "Does not bowl",
+  "role": "WK",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 89
+ },
+ {
+  "id": "shubman-gill",
+  "name": "Shubman Gill",
+  "photo": "",
+  "nat": "India",
+  "born": 1999,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm off-break",
+  "role": "BAT",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 89
+ },
+ {
+  "id": "suryakumar-yadav",
+  "name": "Suryakumar Yadav",
+  "photo": "",
+  "nat": "India",
+  "born": 1990,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm off-break",
+  "role": "BAT",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 94
+ },
+ {
+  "id": "yashasvi-jaiswal",
+  "name": "Yashasvi Jaiswal",
+  "photo": "",
+  "nat": "India",
+  "born": 2001,
+  "bat": "Left-hand bat",
+  "bowl": "Right-arm leg-break",
+  "role": "BAT",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 90
+ },
+ {
+  "id": "ruturaj-gaikwad",
+  "name": "Ruturaj Gaikwad",
+  "photo": "",
+  "nat": "India",
+  "born": 1997,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm off-break",
+  "role": "BAT",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 86
+ },
+ {
+  "id": "sanju-samson",
+  "name": "Sanju Samson",
+  "photo": "",
+  "nat": "India",
+  "born": 1994,
+  "bat": "Right-hand bat",
+  "bowl": "Does not bowl",
+  "role": "WK",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 88
+ },
+ {
+  "id": "shreyas-iyer",
+  "name": "Shreyas Iyer",
+  "photo": "",
+  "nat": "India",
+  "born": 1994,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm leg-break",
+  "role": "BAT",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 86
+ },
+ {
+  "id": "pat-cummins",
+  "name": "Pat Cummins",
+  "photo": "",
+  "nat": "Australia",
+  "born": 1993,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm fast",
+  "role": "BOWL",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 91
+ },
+ {
+  "id": "mitchell-starc",
+  "name": "Mitchell Starc",
+  "photo": "",
+  "nat": "Australia",
+  "born": 1990,
+  "bat": "Left-hand bat",
+  "bowl": "Left-arm fast",
+  "role": "BOWL",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 90
+ },
+ {
+  "id": "travis-head",
+  "name": "Travis Head",
+  "photo": "",
+  "nat": "Australia",
+  "born": 1993,
+  "bat": "Left-hand bat",
+  "bowl": "Right-arm off-break",
+  "role": "BAT",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 93
+ },
+ {
+  "id": "glenn-maxwell",
+  "name": "Glenn Maxwell",
+  "photo": "",
+  "nat": "Australia",
+  "born": 1988,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm off-break",
+  "role": "AR",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 88
+ },
+ {
+  "id": "jos-buttler",
+  "name": "Jos Buttler",
+  "photo": "",
+  "nat": "England",
+  "born": 1990,
+  "bat": "Right-hand bat",
+  "bowl": "Does not bowl",
+  "role": "WK",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 92
+ },
+ {
+  "id": "ben-stokes",
+  "name": "Ben Stokes",
+  "photo": "",
+  "nat": "England",
+  "born": 1991,
+  "bat": "Left-hand bat",
+  "bowl": "Right-arm fast-medium",
+  "role": "AR",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 90
+ },
+ {
+  "id": "rashid-khan",
+  "name": "Rashid Khan",
+  "photo": "",
+  "nat": "Afghanistan",
+  "born": 1998,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm leg-break",
+  "role": "BOWL",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 95
+ },
+ {
+  "id": "heinrich-klaasen",
+  "name": "Heinrich Klaasen",
+  "photo": "",
+  "nat": "South Africa",
+  "born": 1991,
+  "bat": "Right-hand bat",
+  "bowl": "Does not bowl",
+  "role": "WK",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 93
+ },
+ {
+  "id": "kagiso-rabada",
+  "name": "Kagiso Rabada",
+  "photo": "",
+  "nat": "South Africa",
+  "born": 1995,
+  "bat": "Left-hand bat",
+  "bowl": "Right-arm fast",
+  "role": "BOWL",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 90
+ },
+ {
+  "id": "andre-russell",
+  "name": "Andre Russell",
+  "photo": "",
+  "nat": "West Indies",
+  "born": 1988,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm fast",
+  "role": "AR",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 91
+ },
+ {
+  "id": "sunil-narine",
+  "name": "Sunil Narine",
+  "photo": "",
+  "nat": "West Indies",
+  "born": 1988,
+  "bat": "Left-hand bat",
+  "bowl": "Right-arm off-break",
+  "role": "AR",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 91
+ },
+ {
+  "id": "jofra-archer",
+  "name": "Jofra Archer",
+  "photo": "",
+  "nat": "England",
+  "born": 1995,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm fast",
+  "role": "BOWL",
+  "base": 200,
+  "ipl": [],
+  "available": true,
+  "rating": 89
+ },
+ {
+  "id": "yuzvendra-chahal",
+  "name": "Yuzvendra Chahal",
+  "photo": "",
+  "nat": "India",
+  "born": 1990,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm leg-break",
+  "role": "BOWL",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 87
+ },
+ {
+  "id": "mohammed-shami",
+  "name": "Mohammed Shami",
+  "photo": "",
+  "nat": "India",
+  "born": 1990,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm fast-medium",
+  "role": "BOWL",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 88
+ },
+ {
+  "id": "mohammed-siraj",
+  "name": "Mohammed Siraj",
+  "photo": "",
+  "nat": "India",
+  "born": 1994,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm fast-medium",
+  "role": "BOWL",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 87
+ },
+ {
+  "id": "kuldeep-yadav",
+  "name": "Kuldeep Yadav",
+  "photo": "",
+  "nat": "India",
+  "born": 1994,
+  "bat": "Left-hand bat",
+  "bowl": "Left-arm wrist-spin",
+  "role": "BOWL",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 89
+ },
+ {
+  "id": "axar-patel",
+  "name": "Axar Patel",
+  "photo": "",
+  "nat": "India",
+  "born": 1994,
+  "bat": "Left-hand bat",
+  "bowl": "Slow left-arm orthodox",
+  "role": "AR",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 86
+ },
+ {
+  "id": "tilak-varma",
+  "name": "Tilak Varma",
+  "photo": "",
+  "nat": "India",
+  "born": 2002,
+  "bat": "Left-hand bat",
+  "bowl": "Right-arm off-break",
+  "role": "BAT",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 85
+ },
+ {
+  "id": "rinku-singh",
+  "name": "Rinku Singh",
+  "photo": "",
+  "nat": "India",
+  "born": 1997,
+  "bat": "Left-hand bat",
+  "bowl": "Right-arm off-break",
+  "role": "BAT",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 84
+ },
+ {
+  "id": "arshdeep-singh",
+  "name": "Arshdeep Singh",
+  "photo": "",
+  "nat": "India",
+  "born": 1999,
+  "bat": "Left-hand bat",
+  "bowl": "Left-arm fast-medium",
+  "role": "BOWL",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 87
+ },
+ {
+  "id": "bhuvneshwar-kumar",
+  "name": "Bhuvneshwar Kumar",
+  "photo": "",
+  "nat": "India",
+  "born": 1990,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm fast-medium",
+  "role": "BOWL",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 84
+ },
+ {
+  "id": "ishan-kishan",
+  "name": "Ishan Kishan",
+  "photo": "",
+  "nat": "India",
+  "born": 1998,
+  "bat": "Left-hand bat",
+  "bowl": "Does not bowl",
+  "role": "WK",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 82
+ },
+ {
+  "id": "david-warner",
+  "name": "David Warner",
+  "photo": "",
+  "nat": "Australia",
+  "born": 1986,
+  "bat": "Left-hand bat",
+  "bowl": "Right-arm leg-break",
+  "role": "BAT",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 86
+ },
+ {
+  "id": "marcus-stoinis",
+  "name": "Marcus Stoinis",
+  "photo": "",
+  "nat": "Australia",
+  "born": 1989,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm medium",
+  "role": "AR",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 82
+ },
+ {
+  "id": "josh-hazlewood",
+  "name": "Josh Hazlewood",
+  "photo": "",
+  "nat": "Australia",
+  "born": 1991,
+  "bat": "Left-hand bat",
+  "bowl": "Right-arm fast-medium",
+  "role": "BOWL",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 88
+ },
+ {
+  "id": "mitchell-marsh",
+  "name": "Mitchell Marsh",
+  "photo": "",
+  "nat": "Australia",
+  "born": 1991,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm fast-medium",
+  "role": "AR",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 83
+ },
+ {
+  "id": "trent-boult",
+  "name": "Trent Boult",
+  "photo": "",
+  "nat": "New Zealand",
+  "born": 1989,
+  "bat": "Right-hand bat",
+  "bowl": "Left-arm fast-medium",
+  "role": "BOWL",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 89
+ },
+ {
+  "id": "kane-williamson",
+  "name": "Kane Williamson",
+  "photo": "",
+  "nat": "New Zealand",
+  "born": 1990,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm off-break",
+  "role": "BAT",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 82
+ },
+ {
+  "id": "nicholas-pooran",
+  "name": "Nicholas Pooran",
+  "photo": "",
+  "nat": "West Indies",
+  "born": 1995,
+  "bat": "Left-hand bat",
+  "bowl": "Does not bowl",
+  "role": "WK",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 88
+ },
+ {
+  "id": "quinton-de-kock",
+  "name": "Quinton de Kock",
+  "photo": "",
+  "nat": "South Africa",
+  "born": 1992,
+  "bat": "Left-hand bat",
+  "bowl": "Does not bowl",
+  "role": "WK",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 86
+ },
+ {
+  "id": "faf-du-plessis",
+  "name": "Faf du Plessis",
+  "photo": "",
+  "nat": "South Africa",
+  "born": 1984,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm leg-break",
+  "role": "BAT",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 84
+ },
+ {
+  "id": "liam-livingstone",
+  "name": "Liam Livingstone",
+  "photo": "",
+  "nat": "England",
+  "born": 1993,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm leg-break",
+  "role": "AR",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 82
+ },
+ {
+  "id": "phil-salt",
+  "name": "Phil Salt",
+  "photo": "",
+  "nat": "England",
+  "born": 1996,
+  "bat": "Right-hand bat",
+  "bowl": "Does not bowl",
+  "role": "WK",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 87
+ },
+ {
+  "id": "sam-curran",
+  "name": "Sam Curran",
+  "photo": "",
+  "nat": "England",
+  "born": 1998,
+  "bat": "Left-hand bat",
+  "bowl": "Left-arm fast-medium",
+  "role": "AR",
+  "base": 150,
+  "ipl": [],
+  "available": true,
+  "rating": 82
+ },
+ {
+  "id": "washington-sundar",
+  "name": "Washington Sundar",
+  "photo": "",
+  "nat": "India",
+  "born": 1999,
+  "bat": "Left-hand bat",
+  "bowl": "Right-arm off-break",
+  "role": "AR",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 79
+ },
+ {
+  "id": "shivam-dube",
+  "name": "Shivam Dube",
+  "photo": "",
+  "nat": "India",
+  "born": 1993,
+  "bat": "Left-hand bat",
+  "bowl": "Right-arm medium",
+  "role": "AR",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 80
+ },
+ {
+  "id": "nitish-kumar-reddy",
+  "name": "Nitish Kumar Reddy",
+  "photo": "",
+  "nat": "India",
+  "born": 2003,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm medium",
+  "role": "AR",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 79
+ },
+ {
+  "id": "abhishek-sharma",
+  "name": "Abhishek Sharma",
+  "photo": "",
+  "nat": "India",
+  "born": 2000,
+  "bat": "Left-hand bat",
+  "bowl": "Slow left-arm orthodox",
+  "role": "AR",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 85
+ },
+ {
+  "id": "varun-chakravarthy",
+  "name": "Varun Chakravarthy",
+  "photo": "",
+  "nat": "India",
+  "born": 1991,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm leg-break",
+  "role": "BOWL",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 86
+ },
+ {
+  "id": "t-natarajan",
+  "name": "T Natarajan",
+  "photo": "",
+  "nat": "India",
+  "born": 1991,
+  "bat": "Left-hand bat",
+  "bowl": "Left-arm fast-medium",
+  "role": "BOWL",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 80
+ },
+ {
+  "id": "prasidh-krishna",
+  "name": "Prasidh Krishna",
+  "photo": "",
+  "nat": "India",
+  "born": 1996,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm fast-medium",
+  "role": "BOWL",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 80
+ },
+ {
+  "id": "avesh-khan",
+  "name": "Avesh Khan",
+  "photo": "",
+  "nat": "India",
+  "born": 1996,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm fast-medium",
+  "role": "BOWL",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 78
+ },
+ {
+  "id": "harshal-patel",
+  "name": "Harshal Patel",
+  "photo": "",
+  "nat": "India",
+  "born": 1991,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm fast-medium",
+  "role": "BOWL",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 80
+ },
+ {
+  "id": "deepak-chahar",
+  "name": "Deepak Chahar",
+  "photo": "",
+  "nat": "India",
+  "born": 1992,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm medium",
+  "role": "BOWL",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 79
+ },
+ {
+  "id": "sai-sudharsan",
+  "name": "Sai Sudharsan",
+  "photo": "",
+  "nat": "India",
+  "born": 2001,
+  "bat": "Left-hand bat",
+  "bowl": "Does not bowl",
+  "role": "BAT",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 83
+ },
+ {
+  "id": "devdutt-padikkal",
+  "name": "Devdutt Padikkal",
+  "photo": "",
+  "nat": "India",
+  "born": 2000,
+  "bat": "Left-hand bat",
+  "bowl": "Does not bowl",
+  "role": "BAT",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 76
+ },
+ {
+  "id": "rajat-patidar",
+  "name": "Rajat Patidar",
+  "photo": "",
+  "nat": "India",
+  "born": 1993,
+  "bat": "Right-hand bat",
+  "bowl": "Does not bowl",
+  "role": "BAT",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 80
+ },
+ {
+  "id": "jitesh-sharma",
+  "name": "Jitesh Sharma",
+  "photo": "",
+  "nat": "India",
+  "born": 1993,
+  "bat": "Right-hand bat",
+  "bowl": "Does not bowl",
+  "role": "WK",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 77
+ },
+ {
+  "id": "dhruv-jurel",
+  "name": "Dhruv Jurel",
+  "photo": "",
+  "nat": "India",
+  "born": 2001,
+  "bat": "Right-hand bat",
+  "bowl": "Does not bowl",
+  "role": "WK",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 77
+ },
+ {
+  "id": "ryan-rickelton",
+  "name": "Ryan Rickelton",
+  "photo": "",
+  "nat": "South Africa",
+  "born": 1996,
+  "bat": "Left-hand bat",
+  "bowl": "Does not bowl",
+  "role": "WK",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 78
+ },
+ {
+  "id": "aiden-markram",
+  "name": "Aiden Markram",
+  "photo": "",
+  "nat": "South Africa",
+  "born": 1994,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm off-break",
+  "role": "BAT",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 81
+ },
+ {
+  "id": "david-miller",
+  "name": "David Miller",
+  "photo": "",
+  "nat": "South Africa",
+  "born": 1989,
+  "bat": "Left-hand bat",
+  "bowl": "Right-arm off-break",
+  "role": "BAT",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 82
+ },
+ {
+  "id": "marco-jansen",
+  "name": "Marco Jansen",
+  "photo": "",
+  "nat": "South Africa",
+  "born": 2000,
+  "bat": "Left-hand bat",
+  "bowl": "Left-arm fast-medium",
+  "role": "AR",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 80
+ },
+ {
+  "id": "shimron-hetmyer",
+  "name": "Shimron Hetmyer",
+  "photo": "",
+  "nat": "West Indies",
+  "born": 1996,
+  "bat": "Left-hand bat",
+  "bowl": "Does not bowl",
+  "role": "BAT",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 79
+ },
+ {
+  "id": "rachin-ravindra",
+  "name": "Rachin Ravindra",
+  "photo": "",
+  "nat": "New Zealand",
+  "born": 1999,
+  "bat": "Left-hand bat",
+  "bowl": "Slow left-arm orthodox",
+  "role": "AR",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 79
+ },
+ {
+  "id": "devon-conway",
+  "name": "Devon Conway",
+  "photo": "",
+  "nat": "New Zealand",
+  "born": 1991,
+  "bat": "Left-hand bat",
+  "bowl": "Does not bowl",
+  "role": "BAT",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 79
+ },
+ {
+  "id": "lockie-ferguson",
+  "name": "Lockie Ferguson",
+  "photo": "",
+  "nat": "New Zealand",
+  "born": 1991,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm fast",
+  "role": "BOWL",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 80
+ },
+ {
+  "id": "wanindu-hasaranga",
+  "name": "Wanindu Hasaranga",
+  "photo": "",
+  "nat": "Sri Lanka",
+  "born": 1997,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm leg-break",
+  "role": "AR",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 81
+ },
+ {
+  "id": "maheesh-theekshana",
+  "name": "Maheesh Theekshana",
+  "photo": "",
+  "nat": "Sri Lanka",
+  "born": 2000,
+  "bat": "Right-hand bat",
+  "bowl": "Right-arm off-break",
+  "role": "BOWL",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 77
+ },
+ {
+  "id": "mustafizur-rahman",
+  "name": "Mustafizur Rahman",
+  "photo": "",
+  "nat": "Bangladesh",
+  "born": 1995,
+  "bat": "Left-hand bat",
+  "bowl": "Left-arm fast-medium",
+  "role": "BOWL",
+  "base": 100,
+  "ipl": [],
+  "available": true,
+  "rating": 79
+ }
+]
