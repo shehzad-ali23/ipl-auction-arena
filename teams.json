@@ -1,0 +1,12 @@
+[
+{"id":"csk","name":"Chennai Super Kings","short":"CSK","c1":"#F9CD05","c2":"#1A4FA0"},
+{"id":"mi","name":"Mumbai Indians","short":"MI","c1":"#004BA0","c2":"#D1AB3E"},
+{"id":"rcb","name":"Royal Challengers Bengaluru","short":"RCB","c1":"#D1171B","c2":"#1A1A1A"},
+{"id":"kkr","name":"Kolkata Knight Riders","short":"KKR","c1":"#3A225D","c2":"#B3A123"},
+{"id":"srh","name":"Sunrisers Hyderabad","short":"SRH","c1":"#FF822A","c2":"#1A1A1A"},
+{"id":"rr","name":"Rajasthan Royals","short":"RR","c1":"#EA1A85","c2":"#254AA5"},
+{"id":"dc","name":"Delhi Capitals","short":"DC","c1":"#17449B","c2":"#EF1B23"},
+{"id":"pbks","name":"Punjab Kings","short":"PBKS","c1":"#D71920","c2":"#A7A9AC"},
+{"id":"gt","name":"Gujarat Titans","short":"GT","c1":"#1B2133","c2":"#B59C6C"},
+{"id":"lsg","name":"Lucknow Super Giants","short":"LSG","c1":"#0057E2","c2":"#FFC82E"}
+]

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#060a16">
+<title>IPL Auction Arena</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🏏%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body data-view="home">
+<header class="top">
+  <a class="brand" href="/"><span class="mark">🏏</span><span>IPL <b>AUCTION</b> ARENA</span></a>
+  <nav class="links"><a href="#how">How to play</a><a href="#teams">Franchises</a><a href="#rules">Rules</a></nav>
+  <div class="topright"><span id="roomtag" class="pill" hidden></span><button id="leaveBtn" class="ghost sm" hidden data-top="leave">Leave</button></div>
+</header>
+<div id="conn" class="conn" hidden>Reconnecting…</div>
+<main id="app"></main>
+<nav class="bnav">
+  <button data-a="tab" data-v="auction">🔨<span>Auction</span></button>
+  <button data-a="tab" data-v="teams">🏟️<span>Teams</span></button>
+  <button data-a="tab" data-v="log">📜<span>Sold</span></button>
+</nav>
+<div id="toasts"></div>
+<script src="/socket.io/socket.io.js"></script>
+<script src="/js/app.js"></script>
+</body>
+</html>

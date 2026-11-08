@@ -1,0 +1,10 @@
+{
+  "name": "ipl-auction-arena",
+  "version": "1.0.0",
+  "description": "Real-time multiplayer IPL auction game (Express + Socket.IO + PostgreSQL)",
+  "main": "server/server.js",
+  "scripts": { "start": "node server/server.js", "dev": "node server/server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "express": "^4.19.2", "pg": "^8.12.0", "socket.io": "^4.7.5" },
+  "license": "MIT"
+}
